@@ -1,0 +1,22 @@
+# --- 基础框架 ---
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-openai>=0.2.0
+streamlit>=1.38.0
+
+# --- 向量数据库 ---
+chromadb>=0.5.0
+
+# --- 数据处理 ---
+python-dotenv>=1.0.0
+pypdf>=5.0.0
+pymupdf>=1.24.0          # 【新增】更强更快的 PDF 解析库
+tiktoken>=0.7.0
+cryptography>=3.1
+
+# --- AI 模型支持 ---
+langchain-huggingface>=0.1.0
+sentence-transformers>=3.0.0
+
+# --- GPU 支持 ---
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121

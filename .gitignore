@@ -5,3 +5,5 @@ venv/
 .env
 env/
 .conda/
+chroma_db/
+data/

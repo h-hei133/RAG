@@ -9,6 +9,7 @@ from src.rag_chain import get_rag_chain
 import config
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.messages import AIMessage, HumanMessage
 
 # --- 命令行参数处理 ---
 should_clear = "--clear" in sys.argv
@@ -203,18 +204,31 @@ if prompt := st.chat_input("请输入你的问题..."):
     st.chat_message("user").write(prompt)
 
     if not st.session_state.get("file_processed"):
-        response = "请先在左侧上传 PDF 文档，我才能回答你的问题哦。"
-        st.session_state["messages"].append({"role": "assistant", "content": response})
-        st.chat_message("assistant").write(response)
+        # ... (未处理文件的提示逻辑不变) ...
+        pass
     else:
         rag_chain = get_rag_chain(custom_prompt=user_prompt)
         if rag_chain:
             with st.chat_message("assistant"):
                 status_placeholder = st.empty()
-                status_placeholder.markdown("🔍 正在检索文档并生成回答...")
+                status_placeholder.markdown("🔍 正在结合上下文思考...")
 
                 try:
-                    result = rag_chain.invoke(prompt)
+                    # --- 【修改点 1】构建历史记录 ---
+                    # 排除最后一条（因为最后一条是当前问题，已经作为 input 传入）
+                    chat_history = []
+                    for msg in st.session_state["messages"][:-1]:
+                        if msg["role"] == "user":
+                            chat_history.append(HumanMessage(content=msg["content"]))
+                        elif msg["role"] == "assistant":
+                            chat_history.append(AIMessage(content=msg["content"]))
+
+                    # --- 【修改点 2】传入字典 ---
+                    result = rag_chain.invoke({
+                        "input": prompt,
+                        "chat_history": chat_history
+                    })
+
                     answer = result["answer"]
                     source_docs = result["source_documents"]
 

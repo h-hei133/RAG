@@ -1,73 +1,98 @@
+# src/rag_chain.py
 import os
 import torch
 import config
-import streamlit as st  # 引入 streamlit 用于缓存
+import streamlit as st
+from operator import itemgetter
 
 # LangChain 核心组件
 from langchain_openai import ChatOpenAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain_core.prompts import ChatPromptTemplate
-# 注意：我们移除了 RunnablePassthrough 等复杂的链式组件，改用手动执行
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import AIMessage, HumanMessage
+
+# Rerank 相关组件
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
 # 设定向量数据库路径
 PERSIST_DIRECTORY = "./chroma_db"
 
 
-# --- 1. 手动模式的 RAG 链类 (核心修复) ---
-class ManualRAGChain:
+# --- 1. 手动模式：支持历史感知 + Rerank 的 RAG 链 ---
+class ManualHistoryRAGChain:
     """
-    手动执行 RAG 流程，不依赖复杂的 LangChain 自动流水线。
-    这能彻底避免 'NoneType' 和 Pydantic 版本冲突错误，同时保持极高的灵活性。
+    手动执行带历史记录 + 重排序的 RAG 流程。
     """
 
-    def __init__(self, retriever, prompt, llm):
+    def __init__(self, retriever, qa_prompt, history_prompt, llm):
         self.retriever = retriever
-        self.prompt = prompt
+        self.qa_prompt = qa_prompt  # 用于回答问题的 Prompt
+        self.history_prompt = history_prompt  # 用于重写问题的 Prompt
         self.llm = llm
         self.output_parser = StrOutputParser()
 
-    def invoke(self, question: str):
+    def _rewrite_question(self, question, chat_history):
         """
-        手动控制每一步执行
+        内部辅助函数：利用 LLM 重写问题
         """
-        # 1. 检索 (直接调用检索器，获取 List[Document])
-        # print(f"DEBUG: 正在检索... (MMR模式)")
-        docs = self.retriever.invoke(question)
+        # print(f"DEBUG: 正在根据历史记录重写问题...")
+        formatted_history_prompt = self.history_prompt.invoke({
+            "chat_history": chat_history,
+            "input": question
+        })
+        response = self.llm.invoke(formatted_history_prompt)
+        standalone_question = self.output_parser.invoke(response)
+        # print(f"DEBUG: 问题重写结果: {standalone_question}")
+        return standalone_question
 
-        # 2. 格式化上下文 (纯 Python 字符串处理，绝对安全)
-        if not docs:
-            context_str = ""
+    def invoke(self, input_dict: dict):
+        """
+        执行主流程
+        input_dict 结构: {"input": "用户问题", "chat_history": [消息列表]}
+        """
+        question = input_dict.get("input")
+        chat_history = input_dict.get("chat_history", [])
+
+        # --- 步骤 1: 确定用于检索的问题 ---
+        if chat_history:
+            # 如果有历史，先重写问题
+            search_query = self._rewrite_question(question, chat_history)
         else:
-            context_str = "\n\n".join([d.page_content for d in docs])
+            # 如果没历史，直接用原问题
+            search_query = question
 
-        # 3. 填充 Prompt
-        # 将 context 和 question 填入模板
-        formatted_prompt = self.prompt.invoke({
+        # --- 步骤 2: 检索文档 (集成 Rerank) ---
+        # 这里的 self.retriever 已经是包含 Rerank 的检索器了
+        # print(f"DEBUG: 正在检索: {search_query}")
+        docs = self.retriever.invoke(search_query)
+
+        # --- 步骤 3: 格式化上下文 ---
+        context_str = "\n\n".join([d.page_content for d in docs]) if docs else ""
+
+        # --- 步骤 4: 生成最终回答 ---
+        # 将 chat_history 也传给最终 Prompt，让 LLM 看到完整的上下文
+        formatted_qa_prompt = self.qa_prompt.invoke({
+            "chat_history": chat_history,
             "context": context_str,
-            "question": question
+            "question": question  # 回答时使用用户的原始问题
         })
 
-        # 4. LLM 生成
-        ai_message = self.llm.invoke(formatted_prompt)
-
-        # 5. 解析结果
+        ai_message = self.llm.invoke(formatted_qa_prompt)
         answer = self.output_parser.invoke(ai_message)
 
-        # 6. 返回标准字典格式 (兼容前端)
         return {
             "answer": answer,
             "source_documents": docs
         }
 
 
-# --- 2. 缓存 Embedding 模型 (保留你的优化) ---
+# --- 2. 缓存 Embedding 模型 ---
 @st.cache_resource
 def load_embedding_model():
-    """
-    使用 Streamlit 缓存加载 Embedding 模型，避免每次刷新页面都重新加载。
-    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"正在初始化 Embedding 模型 (设备: {device})...")
     return HuggingFaceEmbeddings(
@@ -78,31 +103,41 @@ def load_embedding_model():
 
 # --- 3. 初始化函数 ---
 def get_rag_chain(custom_prompt=None):
-    """
-    初始化 RAG 链 (Manual Mode + High Performance Cache)
-    """
-    # 1. 获取缓存的 Embedding 模型
+    # 1. 准备 Embedding
     embeddings = load_embedding_model()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 2. 加载向量数据库
     if not os.path.exists(PERSIST_DIRECTORY):
         return None
 
+    # 2. 基础检索器 (Chroma)
     vectorstore = Chroma(
         persist_directory=PERSIST_DIRECTORY,
         embedding_function=embeddings
     )
 
-    # 3. 创建检索器 (保留了你的 MMR 配置)
-    # MMR (最大边际相关性) 能在保持相关性的同时增加内容的多样性
-    retriever = vectorstore.as_retriever(
+    # 基础检索：先召回 20 个片段 (fetch_k)
+    base_retriever = vectorstore.as_retriever(
         search_type="mmr",
-        search_kwargs={
-            "k": 8,  # 最终返回 8 个片段
-            "fetch_k": 20,  # 初始搜索 20 个片段进行筛选
-            "lambda_mult": 0.7  # 多样性系数 (越小越多样)
-        }
+        search_kwargs={"k": 20, "fetch_k": 50, "lambda_mult": 0.7}
     )
+
+    # 3. 集成 Rerank (重排序)
+    try:
+        print(f"正在加载 Rerank 模型: {config.RERANKER_MODEL_NAME}")
+        rerank_model = HuggingFaceCrossEncoder(
+            model_name=config.RERANKER_MODEL_NAME,
+            model_kwargs={'device': device}
+        )
+        # 从 20 个里挑出最相关的 5 个
+        compressor = CrossEncoderReranker(model=rerank_model, top_n=5)
+        final_retriever = ContextualCompressionRetriever(
+            base_compressor=compressor,
+            base_retriever=base_retriever
+        )
+    except Exception as e:
+        print(f"⚠️ Rerank 模型加载失败 ({e})，降级为普通检索...")
+        final_retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
 
     # 4. 初始化 LLM
     llm = ChatOpenAI(
@@ -112,30 +147,47 @@ def get_rag_chain(custom_prompt=None):
         temperature=0.1
     )
 
-    # 5. 动态 Prompt
+    # --- 定义 Prompts ---
+
+    # A. 历史重写 Prompt (System Prompt)
+    contextualize_q_system_prompt = (
+        "Given a chat history and the latest user question "
+        "which might reference context in the chat history, "
+        "formulate a standalone question which can be understood "
+        "without the chat history. Do NOT answer the question, "
+        "just reformulate it if needed and otherwise return it as is."
+    )
+
+    history_prompt = ChatPromptTemplate.from_messages([
+        ("system", contextualize_q_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+
+    # B. 最终回答 Prompt
     if custom_prompt:
-        # 简单的占位符检查
-        if "{context}" not in custom_prompt or "{question}" not in custom_prompt:
-            custom_prompt += "\n\n【上下文】:\n{context}\n\n【用户问题】:\n{question}"
-        template = custom_prompt
+        # 稍微调整以适应 ChatPromptTemplate.from_messages
+        # 这里为了简单，如果用户自定义了 prompt，我们假设他是作为一个 System Message 传入
+        system_template = custom_prompt
     else:
-        template = """你是一个专业的各个领域专家。请基于下面的【上下文】内容回答用户的问题。
+        system_template = """你是一个专业的助手。请基于下面的【上下文】内容回答用户的问题。
+        如果上下文没有相关信息，且聊天记录也没提到，请承认不知道。
 
-            注意：
-            1. 请专注于正文中的技术原理。
-            2. 如果上下文中包含英文内容，请用中文进行总结和回答。
+        【上下文】:
+        {context}
+        """
 
-            【上下文】:
-            {context}
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", system_template),
+        MessagesPlaceholder("chat_history"),  # 注入历史
+        ("human", "{question}"),
+    ])
 
-            【用户问题】:
-            {question}
+    print("✅ RAG Chain 构建成功 (History + Rerank + Manual)")
 
-            回答:"""
-
-    prompt = ChatPromptTemplate.from_template(template)
-
-    # 6. 返回手动组装的链对象
-    # 这里不再使用 | 符号连接，而是直接实例化我们定义的类
-    print("✅ RAG Chain 构建成功 (Manual Mode)")
-    return ManualRAGChain(retriever, prompt, llm)
+    return ManualHistoryRAGChain(
+        retriever=final_retriever,
+        qa_prompt=qa_prompt,
+        history_prompt=history_prompt,
+        llm=llm
+    )

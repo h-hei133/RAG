@@ -22,14 +22,17 @@ from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 
 class ManualHistoryRAGChain:
     """
-    手动实现的 RAG 链，用于处理历史记录重写和问答
+    手动实现的 RAG 链，集成父子索引策略 (Small-to-Big Retrieval)
     """
+
     def __init__(self, retriever, qa_prompt, history_prompt, llm):
         self.retriever = retriever
         self.qa_prompt = qa_prompt
         self.history_prompt = history_prompt
         self.llm = llm
         self.output_parser = StrOutputParser()
+        # 获取父文档存储路径
+        self.doc_store_path = getattr(config, "PARENT_DOC_STORE_PATH", "./doc_store")
 
     def _rewrite_question(self, question, chat_history):
         formatted_history_prompt = self.history_prompt.invoke({
@@ -39,21 +42,63 @@ class ManualHistoryRAGChain:
         response = self.llm.invoke(formatted_history_prompt)
         return self.output_parser.invoke(response)
 
+    def _map_children_to_parents(self, child_docs):
+        """
+        核心逻辑：将检索到的子块 (Child) 映射回父块 (Parent)
+        """
+        parent_docs = []
+        seen_ids = set()
+
+        for child in child_docs:
+            # 1. 获取关联 ID
+            doc_id = child.metadata.get("doc_id")
+
+            # 如果没有 ID 或者已经添加过该父文档，则跳过 (去重)
+            if not doc_id or doc_id in seen_ids:
+                # 如果没有 ID (兼容旧数据)，直接用子块
+                if not doc_id and child.page_content not in [d.page_content for d in parent_docs]:
+                    parent_docs.append(child)
+                continue
+
+            # 2. 从磁盘加载父文档
+            pkl_path = os.path.join(self.doc_store_path, f"{doc_id}.pkl")
+            if os.path.exists(pkl_path):
+                try:
+                    with open(pkl_path, "rb") as f:
+                        parent_doc = pickle.load(f)
+                        parent_docs.append(parent_doc)
+                        seen_ids.add(doc_id)
+                except Exception as e:
+                    print(f"读取父文档失败 {doc_id}: {e}")
+                    # 降级处理：如果读不到父块，就暂时用子块顶替
+                    parent_docs.append(child)
+            else:
+                # 找不到文件，降级使用子块
+                parent_docs.append(child)
+
+        return parent_docs
+
     def invoke(self, input_dict: dict):
         question = input_dict.get("input")
         chat_history = input_dict.get("chat_history", [])
 
-        # 如果有历史记录，重写问题
+        # 1. 历史记录处理
         if chat_history:
             search_query = self._rewrite_question(question, chat_history)
         else:
             search_query = question
 
-        # 执行检索
-        docs = self.retriever.invoke(search_query)
-        context_str = "\n\n".join([d.page_content for d in docs]) if docs else ""
+        # 2. 执行检索 (此时获取的是子块)
+        child_docs = self.retriever.invoke(search_query)
 
-        # 生成答案
+        # 3. 父子索引置换 (Small-to-Big)
+        # 将精准的子块替换为上下文完整的父块
+        final_docs = self._map_children_to_parents(child_docs)
+
+        # 4. 构建上下文 (使用父块内容)
+        context_str = "\n\n".join([d.page_content for d in final_docs]) if final_docs else ""
+
+        # 5. 生成答案
         formatted_qa_prompt = self.qa_prompt.invoke({
             "chat_history": chat_history,
             "context": context_str,
@@ -65,7 +110,8 @@ class ManualHistoryRAGChain:
 
         return {
             "answer": answer,
-            "source_documents": docs
+            # 返回父文档，以便前端展示完整的上下文来源
+            "source_documents": final_docs
         }
 
 
@@ -82,7 +128,7 @@ def get_rag_chain(custom_prompt=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"运行设备: {device}")
 
-    # 1. 向量检索 (Chroma)
+    # 1. 向量检索 (检索子块)
     embeddings = load_embedding_model()
     if not os.path.exists(config.PERSIST_DIRECTORY):
         return None
@@ -96,7 +142,7 @@ def get_rag_chain(custom_prompt=None):
         search_kwargs={"k": 10, "fetch_k": 20, "lambda_mult": 0.7}
     )
 
-    # 2. 关键词检索 (BM25)
+    # 2. 关键词检索 (检索子块)
     bm25_retriever = None
     if os.path.exists(config.BM25_PERSIST_PATH):
         try:
@@ -117,7 +163,8 @@ def get_rag_chain(custom_prompt=None):
     else:
         ensemble_retriever = chroma_retriever
 
-    # 4. 重排序 (Rerank)
+    # 4. 重排序 (对子块进行排序)
+    # Rerank 应该作用于子块，因为子块语义更集中，评分更准
     final_retriever = ensemble_retriever
     if device == "cpu":
         print("CPU模式：跳过 Rerank 步骤")
@@ -173,4 +220,5 @@ def get_rag_chain(custom_prompt=None):
         ("human", "{question}"),
     ])
 
+    # 返回支持父子索引的 Chain
     return ManualHistoryRAGChain(final_retriever, qa_prompt, history_prompt, llm)

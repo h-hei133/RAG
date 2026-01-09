@@ -16,7 +16,13 @@ EMBEDDING_MODEL_NAME = "BAAI/bge-base-zh-v1.5"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
 
 # --- 存储路径 ---
+# 向量数据库 (存储子块向量)
 PERSIST_DIRECTORY = "./chroma_db"
+
+# 父文档存储 (存储父块原始内容)
+PARENT_DOC_STORE_PATH = "./doc_store"
+
+# BM25 索引 (存储子块关键词索引)
 BM25_PERSIST_PATH = "./chroma_db/bm25_documents.pkl"
 
 # --- 上传限制 ---

@@ -4,7 +4,7 @@ import time
 import shutil
 import gc
 import sys
-import chromadb  # 导入 chromadb 用于逻辑重置
+import chromadb
 from src.ingestion import ingest_document
 from src.rag_chain import get_rag_chain
 import config
@@ -22,7 +22,7 @@ if "--clear" in sys.argv and not st.session_state["has_cleared"]:
     st.session_state["has_cleared"] = True
     print("检测到 --clear 参数，尝试清理数据...")
 
-    # 启动阶段的物理清理（此时通常没有文件锁，可以尝试物理删除）
+    # 物理清理 data
     if os.path.exists("data"):
         try:
             shutil.rmtree("data")
@@ -30,6 +30,7 @@ if "--clear" in sys.argv and not st.session_state["has_cleared"]:
         except Exception as e:
             print(f"删除 data 失败: {e}")
 
+    # 物理清理 数据库
     if os.path.exists(config.PERSIST_DIRECTORY):
         try:
             shutil.rmtree(config.PERSIST_DIRECTORY, ignore_errors=True)
@@ -37,24 +38,29 @@ if "--clear" in sys.argv and not st.session_state["has_cleared"]:
         except Exception as e:
             print(f"删除数据库失败: {e}")
 
+    # 【新增】物理清理 父文档存储 (DocStore)
+    # 预读取 config 中的路径，如果 config 还没更新，默认检查 "doc_store"
+    doc_store_path = getattr(config, "PARENT_DOC_STORE_PATH", "doc_store")
+    if os.path.exists(doc_store_path):
+        try:
+            shutil.rmtree(doc_store_path, ignore_errors=True)
+            print(f"已清理父文档存储: {doc_store_path}")
+        except Exception as e:
+            print(f"删除父文档存储失败: {e}")
 
-# --- 3. 重置函数定义 (核心修改部分) ---
+
+# --- 3. 重置函数定义 ---
 def hard_reset_app():
     """
-    重置应用：逻辑清空数据库 -> 清理缓存 -> 删除原始文件
-    遵循 Windows 文件锁安全原则，不强制删除数据库文件夹。
+    重置应用：逻辑清空数据库 -> 清理缓存 -> 删除原始文件 -> 删除父文档存储
     """
     print("执行重置...")
 
-    # 1. 逻辑清空向量数据库 (API 方式，避免 PermissionError)
-    # [cite: 68, 70] 使用 delete_collection 代替 rmtree
+    # 1. 逻辑清空向量数据库 (API 方式)
     if os.path.exists(config.PERSIST_DIRECTORY):
         try:
             print("正在通过 API 清空向量库...")
-            # 获取持久化客户端
             client = chromadb.PersistentClient(path=config.PERSIST_DIRECTORY)
-            # 删除默认集合 (LangChain 默认使用 'langchain')
-            # 即使集合不存在，try-except 也能处理
             try:
                 client.delete_collection("langchain")
                 print("✅ 已删除 'langchain' 集合")
@@ -65,7 +71,7 @@ def hard_reset_app():
         except Exception as e:
             print(f"连接数据库失败: {e}")
 
-    # 2. 物理删除 BM25 索引 (Pickle 文件通常在读取后即关闭，删除较安全)
+    # 2. 物理删除 BM25 索引
     if os.path.exists(config.BM25_PERSIST_PATH):
         try:
             os.remove(config.BM25_PERSIST_PATH)
@@ -73,8 +79,17 @@ def hard_reset_app():
         except Exception as e:
             print(f"删除 BM25 失败: {e}")
 
-    # 3. 物理删除 data 文件夹 (原始 PDF)
-    # 这些文件在 ingestion 后通常已关闭，可以删除
+    # 3. 【新增】物理删除 父文档存储 (DocStore)
+    # 这是父子索引策略中存放"大块"内容的地方
+    doc_store_path = getattr(config, "PARENT_DOC_STORE_PATH", "doc_store")
+    if os.path.exists(doc_store_path):
+        try:
+            shutil.rmtree(doc_store_path)
+            print(f"已删除父文档存储: {doc_store_path}")
+        except Exception as e:
+            st.error(f"无法删除父文档存储 {doc_store_path}: {e}")
+
+    # 4. 物理删除 data 文件夹 (原始 PDF)
     target = "data"
     if os.path.exists(target) and os.path.isdir(target):
         try:
@@ -83,21 +98,20 @@ def hard_reset_app():
         except Exception as e:
             st.error(f"无法删除 {target}，可能文件正在被查看。")
 
-    # 4. 清理 Streamlit 资源缓存 (关键：释放内存中的模型和检索器)
-    #  必须清除缓存以防止僵尸对象残留
+    # 5. 清理 Streamlit 资源缓存
     try:
         st.cache_resource.clear()
         print("已清理资源缓存")
     except Exception as e:
         print(f"清理缓存失败: {e}")
 
-    # 5. 重置 Session State
+    # 6. 重置 Session State
     keys_to_keep = ["has_cleared", "uploader_key"]
     for k in list(st.session_state.keys()):
         if k not in keys_to_keep:
             del st.session_state[k]
 
-    # 更新上传组件 Key，强制刷新界面
+    # 更新上传组件 Key
     st.session_state["uploader_key"] += 1
 
     # 强制 GC
@@ -111,7 +125,7 @@ st.set_page_config(page_title="个人知识库助手", layout="wide")
 
 # 标题
 st.title("🤖 个人专属知识库助手")
-st.caption("Powered by DeepSeek-V3 + Local Embeddings")
+st.caption("Powered by DeepSeek-V3 + Local Embeddings (父子索引版)")
 
 # --- 初始化 Session State ---
 if "processed_files" not in st.session_state:
@@ -129,7 +143,8 @@ with st.sidebar:
     )
 
     # 检查本地是否有存量数据
-    # 注意：这里逻辑微调，只要 database 目录存在就算有数据，具体内容由检索决定
+    # 注意：父子索引需要同时检查 向量库 和 DocStore
+    # 这里简化检查，只要 persist_dir 存在即视为有数据
     has_existing_data = os.path.exists("data") and len(os.listdir("data")) > 0 and os.path.exists(
         config.PERSIST_DIRECTORY)
 
@@ -197,9 +212,7 @@ with st.sidebar:
 
     # 重置按钮
     if st.button("🧨 重置知识库", type="primary"):
-        # 执行重置逻辑
         hard_reset_app()
-        #  状态清理后，立即重启应用以确保 UI 和内存状态同步
         st.rerun()
 
     # 退出按钮
@@ -258,6 +271,7 @@ if prompt := st.chat_input("请输入你的问题..."):
                             source = os.path.basename(doc.metadata.get("source", "未知文件"))
                             page = doc.metadata.get("page", 0) + 1
                             st.markdown(f"**来源 {i + 1}:** `{source}` (第 {page} 页)")
+                            # 这里的 content 是父块（2000字），我们只展示前 150 字预览
                             content_preview = doc.page_content[:150].replace('\n', ' ')
                             st.caption(f"原文片段: ...{content_preview}...")
                             st.divider()

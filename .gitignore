@@ -7,3 +7,5 @@ env/
 .conda/
 chroma_db/
 data/
+doc_store/
+extracted_images/

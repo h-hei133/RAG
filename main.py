@@ -38,8 +38,7 @@ if "--clear" in sys.argv and not st.session_state["has_cleared"]:
         except Exception as e:
             print(f"删除数据库失败: {e}")
 
-    # 【新增】物理清理 父文档存储 (DocStore)
-    # 预读取 config 中的路径，如果 config 还没更新，默认检查 "doc_store"
+    # 物理清理 父文档存储 (DocStore)
     doc_store_path = getattr(config, "PARENT_DOC_STORE_PATH", "doc_store")
     if os.path.exists(doc_store_path):
         try:
@@ -48,13 +47,22 @@ if "--clear" in sys.argv and not st.session_state["has_cleared"]:
         except Exception as e:
             print(f"删除父文档存储失败: {e}")
 
+    # 物理清理 提取的图片存储
+    img_store_path = getattr(config, "IMG_STORE_PATH", "extracted_images")
+    if os.path.exists(img_store_path):
+        try:
+            shutil.rmtree(img_store_path, ignore_errors=True)
+            print(f"已清理提取图片存储: {img_store_path}")
+        except Exception as e:
+            print(f"删除提取图片存储失败: {e}")
+
 
 # --- 3. 重置函数定义 ---
-def hard_reset_app():
+def reset_app():
     """
-    重置应用：逻辑清空数据库 -> 清理缓存 -> 删除原始文件 -> 删除父文档存储
+    重置应用：逻辑清空数据库 -> 清理缓存 -> 删除原始文件 -> 删除中间产物
     """
-    print("执行重置...")
+    print("执行重置中...")
 
     # 1. 逻辑清空向量数据库 (API 方式)
     if os.path.exists(config.PERSIST_DIRECTORY):
@@ -79,8 +87,7 @@ def hard_reset_app():
         except Exception as e:
             print(f"删除 BM25 失败: {e}")
 
-    # 3. 【新增】物理删除 父文档存储 (DocStore)
-    # 这是父子索引策略中存放"大块"内容的地方
+    # 3. 物理删除 父文档存储
     doc_store_path = getattr(config, "PARENT_DOC_STORE_PATH", "doc_store")
     if os.path.exists(doc_store_path):
         try:
@@ -89,7 +96,16 @@ def hard_reset_app():
         except Exception as e:
             st.error(f"无法删除父文档存储 {doc_store_path}: {e}")
 
-    # 4. 物理删除 data 文件夹 (原始 PDF)
+    # 4. 物理删除 提取的图片存储
+    img_store_path = getattr(config, "IMG_STORE_PATH", "extracted_images")
+    if os.path.exists(img_store_path):
+        try:
+            shutil.rmtree(img_store_path)
+            print(f"已删除提取图片存储: {img_store_path}")
+        except Exception as e:
+            st.error(f"无法删除提取图片存储 {img_store_path}: {e}")
+
+    # 5. 物理删除 data 文件夹
     target = "data"
     if os.path.exists(target) and os.path.isdir(target):
         try:
@@ -98,14 +114,14 @@ def hard_reset_app():
         except Exception as e:
             st.error(f"无法删除 {target}，可能文件正在被查看。")
 
-    # 5. 清理 Streamlit 资源缓存
+    # 6. 清理 Streamlit 资源缓存
     try:
         st.cache_resource.clear()
         print("已清理资源缓存")
     except Exception as e:
         print(f"清理缓存失败: {e}")
 
-    # 6. 重置 Session State
+    # 7. 重置 Session State
     keys_to_keep = ["has_cleared", "uploader_key"]
     for k in list(st.session_state.keys()):
         if k not in keys_to_keep:
@@ -123,9 +139,8 @@ def hard_reset_app():
 
 st.set_page_config(page_title="个人知识库助手", layout="wide")
 
-# 标题
 st.title("🤖 个人专属知识库助手")
-st.caption("Powered by DeepSeek-V3 + Local Embeddings (父子索引版)")
+st.caption(f"Powered by {config.LLM_MODEL_NAME} (混合解析版)")
 
 # --- 初始化 Session State ---
 if "processed_files" not in st.session_state:
@@ -135,16 +150,29 @@ if "processed_files" not in st.session_state:
 with st.sidebar:
     st.header("1. 上传文档")
 
+    parse_mode_option = st.radio(
+        "解析策略",
+        ("混合模式 (推荐)", "强制全视觉 (最慢)", "仅快速文本 (最快)"),
+        index=0,
+        help="混合模式：自动检测页面复杂度，有图表时用视觉模型，纯文本时用快速解析。\n强制全视觉：所有页面都用 Qwen-VL，适合极复杂的扫描件。"
+    )
+
+    # 策略映射
+    strategy_map = {
+        "混合模式 (推荐)": "auto",
+        "强制全视觉 (最慢)": "force",
+        "仅快速文本 (最快)": "fast"
+    }
+    selected_strategy = strategy_map[parse_mode_option]
+
     uploaded_files = st.file_uploader(
-        "请上传 PDF 文档 (支持多选)",
+        "请上传 PDF 文档",
         type=["pdf"],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state['uploader_key']}"
     )
 
     # 检查本地是否有存量数据
-    # 注意：父子索引需要同时检查 向量库 和 DocStore
-    # 这里简化检查，只要 persist_dir 存在即视为有数据
     has_existing_data = os.path.exists("data") and len(os.listdir("data")) > 0 and os.path.exists(
         config.PERSIST_DIRECTORY)
 
@@ -170,7 +198,7 @@ with st.sidebar:
                 if total_size_mb > config.MAX_FILE_SIZE_MB:
                     st.error(f"❌ 总大小超过限制！当前: {total_size_mb:.2f}MB, 最大: {config.MAX_FILE_SIZE_MB}MB")
                 else:
-                    with st.spinner(f"正在处理 {len(new_files)} 个新文档..."):
+                    with st.spinner(f"正在处理 {len(new_files)} 个新文档... (策略: {selected_strategy})"):
                         os.makedirs("data", exist_ok=True)
 
                         saved_file_paths = []
@@ -180,7 +208,10 @@ with st.sidebar:
                                 f.write(file.getbuffer())
                             saved_file_paths.append(file_path)
 
-                        success = ingest_document(saved_file_paths)
+                        # 【修改】传递 parsing_strategy 参数
+                        # 注意：ingestion.py 需要同步更新以接收此参数
+                        success = ingest_document(saved_file_paths, parsing_strategy=selected_strategy)
+
                         if success:
                             st.success(f"成功添加 {len(saved_file_paths)} 个新文档！")
                             st.session_state["file_processed"] = True
@@ -212,7 +243,7 @@ with st.sidebar:
 
     # 重置按钮
     if st.button("🧨 重置知识库", type="primary"):
-        hard_reset_app()
+        reset_app()
         st.rerun()
 
     # 退出按钮
@@ -270,7 +301,8 @@ if prompt := st.chat_input("请输入你的问题..."):
                         for i, doc in enumerate(source_docs):
                             source = os.path.basename(doc.metadata.get("source", "未知文件"))
                             page = doc.metadata.get("page", 0) + 1
-                            st.markdown(f"**来源 {i + 1}:** `{source}` (第 {page} 页)")
+                            mode = doc.metadata.get("parsing_mode", "unknown")
+                            st.markdown(f"**来源 {i + 1}:** `{source}` (第 {page} 页) | 模式: `{mode}`")
                             # 这里的 content 是父块（2000字），我们只展示前 150 字预览
                             content_preview = doc.page_content[:150].replace('\n', ' ')
                             st.caption(f"原文片段: ...{content_preview}...")

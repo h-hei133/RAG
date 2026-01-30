@@ -4,14 +4,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- API 配置 ---
-API_KEY = os.getenv("DEEPSEEK_API_KEY")
+API_KEY = os.getenv("API_KEY")
 BASE_URL = os.getenv("SILICON_BASE_URL")
 
 if not API_KEY:
-    raise ValueError("请在 .env 文件中配置 DEEPSEEK_API_KEY")
+    raise ValueError("请在 .env 文件中配置 API_KEY")
 
 # --- 模型配置 ---
-LLM_MODEL_NAME = "deepseek-ai/DeepSeek-V3.2"
+LLM_MODEL_NAME = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+VLM_MODEL_NAME = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 EMBEDDING_MODEL_NAME = "BAAI/bge-base-zh-v1.5"
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-base"
 
@@ -24,6 +25,9 @@ PARENT_DOC_STORE_PATH = "./doc_store"
 
 # BM25 索引 (存储子块关键词索引)
 BM25_PERSIST_PATH = "./chroma_db/bm25_documents.pkl"
+
+# 提取图片存储路径 (用于存放版面分析提取出的图片)
+IMG_STORE_PATH = "./extracted_images"
 
 # --- 上传限制 ---
 MAX_FILE_SIZE_MB = 50

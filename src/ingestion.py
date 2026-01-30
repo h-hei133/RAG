@@ -230,9 +230,13 @@ def ingest_document(file_paths, parsing_strategy="auto"):
             # 步骤 B: 切分父块
             parent_docs = parent_splitter.split_documents(raw_docs)
 
+            import time
+            ingest_time = time.strftime("%Y-%m-%d %H:%M:%S")
+
             for parent_doc in parent_docs:
                 doc_id = str(uuid.uuid4())
                 parent_doc.metadata["doc_id"] = doc_id
+                parent_doc.metadata["ingest_time"] = ingest_time
 
                 # 步骤 C: 保存父块 (存大块)
                 save_path = os.path.join(doc_store_path, f"{doc_id}.pkl")
@@ -241,9 +245,12 @@ def ingest_document(file_paths, parsing_strategy="auto"):
 
                 # 步骤 D: 切分子块 (存向量)
                 child_docs = child_splitter.split_documents([parent_doc])
-                for child in child_docs:
+                for i, child in enumerate(child_docs):
                     child.metadata["doc_id"] = doc_id
+                    child.metadata["child_id"] = f"{doc_id}_{i}"
                     child.metadata["source"] = os.path.basename(file_path)
+                    child.metadata["ingest_time"] = ingest_time
+
 
                 all_child_docs.extend(child_docs)
 

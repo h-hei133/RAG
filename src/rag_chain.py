@@ -18,6 +18,55 @@ from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers import EnsembleRetriever, ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import CrossEncoderReranker
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+import json
+import time
+
+class QueryPlanner:
+    """
+    Query 规划器：负责 Query 重写、分发、HyDE 等高级检索策略
+    """
+    def __init__(self, llm):
+        self.llm = llm
+        self.output_parser = StrOutputParser()
+
+    def plan(self, question: str, chat_history: list):
+        """
+        对 Query 进行意图分析和规划
+        """
+        routing_prompt = f"""分析用户问题，判断其类型并决定检索策略。
+问题: "{question}"
+
+类型判断标准:
+1. GREETING: 打招呼或闲聊。
+2. COMPLEX: 涉及对比、多跳推理或需要从多个方面回答。
+3. ABSTRACT: 概念性问题，适合 HyDE 策略。
+4. SIMPLE: 事实性简单问题。
+
+请只返回一个 JSON 格式，包含:
+"type": "GREETING" | "COMPLEX" | "ABSTRACT" | "SIMPLE",
+"queries": [重写后的查询列表],
+"use_hyde": true | false
+"""
+        try:
+            # 简化版：这里可以用一个小模型快速分类
+            # 为了演示，我们先实现通用的重写逻辑
+            pass
+        except:
+            pass
+        return {"type": "SIMPLE", "queries": [question], "use_hyde": False}
+
+    def generate_hyde_doc(self, question: str):
+        """生成假设性文档 (HyDE)"""
+        prompt = f"请针对以下问题，写一段专业的、百科全书式的回答草稿，用于帮助搜索引擎查找相关文档：\n问题: {question}"
+        response = self.llm.invoke(prompt)
+        return self.output_parser.invoke(response)
+
+    def multi_query_rewrite(self, question: str):
+        """多路变体生成"""
+        prompt = f"针对以下问题，请提供3个语义相同但表述不同的搜索词（每行一个）：\n{question}"
+        response = self.llm.invoke(prompt)
+        variants = self.output_parser.invoke(response).strip().split("\n")
+        return [v.strip() for v in variants if v.strip()]
 
 
 class ManualHistoryRAGChain:
@@ -33,8 +82,10 @@ class ManualHistoryRAGChain:
         self.output_parser = StrOutputParser()
         # 获取父文档存储路径
         self.doc_store_path = getattr(config, "PARENT_DOC_STORE_PATH", "./doc_store")
+        self.planner = QueryPlanner(llm)
 
     def _rewrite_question(self, question, chat_history):
+
         formatted_history_prompt = self.history_prompt.invoke({
             "chat_history": chat_history,
             "input": question
@@ -79,26 +130,57 @@ class ManualHistoryRAGChain:
         return parent_docs
 
     def invoke(self, input_dict: dict):
-        question = input_dict.get("input")
+        start_time = time.time()
+        question = input_dict.get("input", "")
+        if not question:
+            return {"answer": "请输入您的问题。", "source_documents": []}
+            
         chat_history = input_dict.get("chat_history", [])
 
-        # 1. 历史记录处理
+        # 0. 语义缓存 (Phase 4: Semantic Cache - 简单实现)
+        cache_hit = self._check_cache(question)
+        if cache_hit:
+            return {
+                "answer": cache_hit,
+                "source_documents": [],
+                "log_data": {"cache": "hit", "question": question}
+            }
+
+        # 1. 历史记录处理 (指代消解)
         if chat_history:
             search_query = self._rewrite_question(question, chat_history)
         else:
             search_query = question
 
-        # 2. 执行检索 (此时获取的是子块)
-        child_docs = self.retriever.invoke(search_query)
+        # 2. 规划与增强 (Phase 2: Query Planner)
+        # 简单路由逻辑：闲聊不检索
+        is_greeting = len(question) < 10 and any(word in question for word in ["你好", "谢谢", "再见", "hi", "hello"])
+        
+        child_docs = []
+        if is_greeting:
+            planning_type = "GREETING"
+            final_docs = []
+            context_str = ""
+        else:
+            planning_type = "SIMPLE"
+            # 尝试 HyDE (针对抽象问题)
+            is_abstract = any(word in question for word in ["是什么", "如何", "建议", "竞争力", "核心", "原理"])
+            if is_abstract:
+                planning_type = "ABSTRACT"
+                hyde_doc = self.planner.generate_hyde_doc(search_query)
+                final_query = f"{search_query}\n{hyde_doc}"
+            else:
+                final_query = search_query
+            
+            # 3. 执行检索 (此时获取的是子块)
+            child_docs = self.retriever.invoke(final_query)
 
-        # 3. 父子索引置换 (Small-to-Big)
-        # 将精准的子块替换为上下文完整的父块
-        final_docs = self._map_children_to_parents(child_docs)
+            # 4. 父子索引置换 (Small-to-Big)
+            # 将精准的子块替换为上下文完整的父块
+            final_docs = self._map_children_to_parents(child_docs)
+            context_str = "\n\n".join([d.page_content for d in final_docs])
 
-        # 4. 构建上下文 (使用父块内容)
-        context_str = "\n\n".join([d.page_content for d in final_docs]) if final_docs else ""
-
-        # 5. 生成答案
+        # 6. 生成答案
         formatted_qa_prompt = self.qa_prompt.invoke({
             "chat_history": chat_history,
             "context": context_str,
@@ -108,11 +190,71 @@ class ManualHistoryRAGChain:
         ai_message = self.llm.invoke(formatted_qa_prompt)
         answer = self.output_parser.invoke(ai_message)
 
+        end_time = time.time()
+        
+        # 7. 数据埋点记录 (Phase 3: Feedback Loop)
+        log_data = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "latency": end_time - start_time,
+            "question": question,
+            "rewrite_query": search_query,
+            "planning_type": planning_type,
+            "retrieved_doc_ids": [d.metadata.get("doc_id", "unknown") for d in child_docs],
+            "answer": answer
+        }
+        self._save_log(log_data)
+        
+        # 存入缓存
+        if not is_greeting and answer:
+            self._update_cache(question, answer)
+
         return {
             "answer": answer,
-            # 返回父文档，以便前端展示完整的上下文来源
-            "source_documents": final_docs
+            "source_documents": final_docs,
+            "log_data": log_data
         }
+
+    def _check_cache(self, question):
+        """简单本地缓存检查"""
+        cache_path = "./logs/cache.json"
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+                return cache.get(question)
+            except:
+                return None
+        return None
+
+    def _update_cache(self, question, answer):
+        """更新本地缓存"""
+        cache_path = "./logs/cache.json"
+        os.makedirs("./logs", exist_ok=True)
+        cache = {}
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            except:
+                pass
+        
+        cache[question] = answer
+        # 限制缓存大小
+        if len(cache) > 1000:
+            first_key = next(iter(cache))
+            del cache[first_key]
+            
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+
+    def _save_log(self, log_data):
+        """保存日志用于后续 A/B 测试和评估"""
+        log_dir = "./logs"
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "rag_activity.jsonl")
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
+
 
 
 @st.cache_resource

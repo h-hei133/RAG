@@ -3,6 +3,7 @@ import pickle
 import uuid
 import fitz  # PyMuPDF
 import base64
+import sqlite3
 from PIL import Image
 import config
 import torch
@@ -14,6 +15,26 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
+
+
+def init_db():
+    """
+    初始化 SQLite 数据库，创建父文档存储表
+    使用 BLOB 存储 pickle 序列化的 Document 对象，确保完全兼容
+    """
+    db_path = getattr(config, "SQLITE_DB_PATH", "./doc_store.db")
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS parent_docs (
+            doc_id TEXT PRIMARY KEY,
+            data BLOB NOT NULL,
+            ingest_time TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    return db_path
 
 
 class DualModePDFParser:
@@ -150,7 +171,7 @@ class DualModePDFParser:
             print(f"    x 视觉解析失败 (P{page_num}): {e}，回退到快速模式")
             return self.parse_fast(page, filename, page_num)
 
-    def parse(self, file_path, use_vision_strategy="auto"):
+    def parse(self, file_path, use_vision_strategy="auto", progress_callback=None):
         """
         入口函数
         use_vision_strategy:
@@ -189,11 +210,20 @@ class DualModePDFParser:
 
             parsed_docs.append(res_doc)
 
+            # 进度回调
+            if progress_callback:
+                total_pages = len(doc)
+                progress_callback(
+                    page_num + 1, 
+                    total_pages, 
+                    f"正在使用 AI 视觉模型阅读第 {page_num + 1}/{total_pages} 页..." if is_complex else f"快速解析第 {page_num + 1}/{total_pages} 页..."
+                )
+
         doc.close()
         return parsed_docs
 
 
-def ingest_document(file_paths, parsing_strategy="auto"):
+def ingest_document(file_paths, parsing_strategy="auto", progress_callback=None):
     """
     全流程接入：
     1. 自适应混合解析 (Smart Hybrid Parsing)
@@ -203,15 +233,14 @@ def ingest_document(file_paths, parsing_strategy="auto"):
     if isinstance(file_paths, str):
         file_paths = [file_paths]
 
+    # 初始化 SQLite 数据库
+    db_path = init_db()
+
     # --- 1. 定义切分器 ---
     parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
     child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
 
     all_child_docs = []
-
-    # 确保存储目录存在
-    doc_store_path = getattr(config, "PARENT_DOC_STORE_PATH", "./doc_store")
-    os.makedirs(doc_store_path, exist_ok=True)
 
     # 初始化解析器
     parser = DualModePDFParser()
@@ -220,8 +249,8 @@ def ingest_document(file_paths, parsing_strategy="auto"):
         if not os.path.exists(file_path):
             continue
         try:
-            # 步骤 A: 解析文档 (传入策略)
-            raw_docs = parser.parse(file_path, use_vision_strategy=parsing_strategy)
+            # 步骤 A: 解析文档 (传入策略和进度回调)
+            raw_docs = parser.parse(file_path, use_vision_strategy=parsing_strategy, progress_callback=progress_callback)
 
             if not raw_docs:
                 print(f"文件 {file_path} 未提取到有效内容")
@@ -238,10 +267,15 @@ def ingest_document(file_paths, parsing_strategy="auto"):
                 parent_doc.metadata["doc_id"] = doc_id
                 parent_doc.metadata["ingest_time"] = ingest_time
 
-                # 步骤 C: 保存父块 (存大块)
-                save_path = os.path.join(doc_store_path, f"{doc_id}.pkl")
-                with open(save_path, "wb") as f:
-                    pickle.dump(parent_doc, f)
+                # 步骤 C: 保存父块到 SQLite (存大块)
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR REPLACE INTO parent_docs (doc_id, data, ingest_time) VALUES (?, ?, ?)",
+                    (doc_id, pickle.dumps(parent_doc), ingest_time)
+                )
+                conn.commit()
+                conn.close()
 
                 # 步骤 D: 切分子块 (存向量)
                 child_docs = child_splitter.split_documents([parent_doc])

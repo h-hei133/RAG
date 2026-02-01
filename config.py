@@ -23,8 +23,14 @@ PERSIST_DIRECTORY = "./chroma_db"
 # 父文档存储 (存储父块原始内容)
 PARENT_DOC_STORE_PATH = "./doc_store"
 
+# SQLite 数据库路径 (存储父块原始内容 - 替代 pkl 文件)
+SQLITE_DB_PATH = "./doc_store.db"
+
 # BM25 索引 (存储子块关键词索引)
 BM25_PERSIST_PATH = "./chroma_db/bm25_documents.pkl"
+
+# 反馈日志路径
+FEEDBACK_LOG_PATH = "./logs/feedback.jsonl"
 
 # 提取图片存储路径 (用于存放版面分析提取出的图片)
 IMG_STORE_PATH = "./extracted_images"

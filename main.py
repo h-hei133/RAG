@@ -6,7 +6,7 @@ import gc
 import sys
 import chromadb
 from src.ingestion import ingest_document
-from src.rag_chain import get_rag_chain
+from src.rag_chain import get_rag_chain, log_feedback
 import config
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -87,12 +87,21 @@ def reset_app():
         except Exception as e:
             print(f"删除 BM25 失败: {e}")
 
-    # 3. 物理删除 父文档存储
+    # 3. 物理删除 SQLite 父文档存储
+    sqlite_path = getattr(config, "SQLITE_DB_PATH", "./doc_store.db")
+    if os.path.exists(sqlite_path):
+        try:
+            os.remove(sqlite_path)
+            print(f"已删除 SQLite 数据库: {sqlite_path}")
+        except Exception as e:
+            print(f"删除 SQLite 数据库失败: {e}")
+
+    # 4. 物理删除旧的 pkl 父文档存储 (向后兼容)
     doc_store_path = getattr(config, "PARENT_DOC_STORE_PATH", "doc_store")
     if os.path.exists(doc_store_path):
         try:
             shutil.rmtree(doc_store_path)
-            print(f"已删除父文档存储: {doc_store_path}")
+            print(f"已删除旧父文档存储: {doc_store_path}")
         except Exception as e:
             st.error(f"无法删除父文档存储 {doc_store_path}: {e}")
 
@@ -198,7 +207,14 @@ with st.sidebar:
                 if total_size_mb > config.MAX_FILE_SIZE_MB:
                     st.error(f"❌ 总大小超过限制！当前: {total_size_mb:.2f}MB, 最大: {config.MAX_FILE_SIZE_MB}MB")
                 else:
-                    with st.spinner(f"正在处理 {len(new_files)} 个新文档... (策略: {selected_strategy})"):
+                    # 创建进度显示区域
+                    progress_container = st.container()
+                    with progress_container:
+                        progress_bar = st.progress(0.0)
+                        status_text = st.empty()
+                        
+                        status_text.text(f"正在准备处理 {len(new_files)} 个新文档...")
+                        
                         os.makedirs("data", exist_ok=True)
 
                         saved_file_paths = []
@@ -207,10 +223,29 @@ with st.sidebar:
                             with open(file_path, "wb") as f:
                                 f.write(file.getbuffer())
                             saved_file_paths.append(file_path)
-
-                        # 【修改】传递 parsing_strategy 参数
-                        # 注意：ingestion.py 需要同步更新以接收此参数
-                        success = ingest_document(saved_file_paths, parsing_strategy=selected_strategy)
+                        
+                        # 定义进度回调函数
+                        def progress_callback(current_page, total_pages, message):
+                            """
+                            进度回调函数，用于更新 Streamlit 进度条
+                            current_page: 当前页码
+                            total_pages: 总页数
+                            message: 状态消息
+                            """
+                            progress = current_page / total_pages if total_pages > 0 else 0
+                            progress_bar.progress(progress)
+                            status_text.text(message)
+                        
+                        # 传递进度回调到 ingest_document
+                        success = ingest_document(
+                            saved_file_paths, 
+                            parsing_strategy=selected_strategy,
+                            progress_callback=progress_callback
+                        )
+                        
+                        # 处理完成，清理进度条
+                        progress_bar.empty()
+                        status_text.empty()
 
                         if success:
                             st.success(f"成功添加 {len(saved_file_paths)} 个新文档！")
@@ -272,7 +307,7 @@ if prompt := st.chat_input("请输入你的问题..."):
         if rag_chain:
             with st.chat_message("assistant"):
                 status_placeholder = st.empty()
-                status_placeholder.markdown("🔍 正在思考...")
+                status_placeholder.markdown("🔍 正在检索并思考...")
 
                 try:
                     # 构建历史记录
@@ -283,32 +318,70 @@ if prompt := st.chat_input("请输入你的问题..."):
                         elif msg["role"] == "assistant":
                             chat_history.append(AIMessage(content=msg["content"]))
 
-                    # 调用链
-                    result = rag_chain.invoke({
+                    # 使用流式生成
+                    stream_gen = rag_chain.stream({
                         "input": prompt,
                         "chat_history": chat_history
                     })
+                    
+                    # 提取第一个元素 (metadata)
+                    metadata = next(stream_gen)
+                    source_docs = metadata.get("source_documents", [])
+                    run_id = metadata.get("run_id", "")
+                    
+                    # 检查是否有错误
+                    if metadata.get("error"):
+                        status_placeholder.empty()
+                        st.warning(metadata["error"])
+                        st.session_state["messages"].append({"role": "assistant", "content": metadata["error"]})
+                    else:
+                        # 清除 "正在思考" 状态
+                        status_placeholder.empty()
+                        
+                        # 流式输出文本
+                        response_placeholder = st.empty()
+                        full_response = ""
+                        
+                        for token in stream_gen:
+                            if isinstance(token, str):
+                                full_response += token
+                                response_placeholder.markdown(full_response + "▌")
+                        
+                        # 移除光标，显示最终结果
+                        response_placeholder.markdown(full_response)
+                        st.session_state["messages"].append({"role": "assistant", "content": full_response})
+                        
+                        # 保存当前 run_id 用于反馈
+                        st.session_state["last_run_id"] = run_id
 
-                    answer = result["answer"]
-                    source_docs = result.get("source_documents", [])
-
-                    status_placeholder.empty()
-                    st.markdown(answer)
-                    st.session_state["messages"].append({"role": "assistant", "content": answer})
-
-                    # 来源展示
-                    with st.expander("📚 参考来源 (点击展开)"):
-                        for i, doc in enumerate(source_docs):
-                            source = os.path.basename(doc.metadata.get("source", "未知文件"))
-                            page = doc.metadata.get("page", 0) + 1
-                            mode = doc.metadata.get("parsing_mode", "unknown")
-                            st.markdown(f"**来源 {i + 1}:** `{source}` (第 {page} 页) | 模式: `{mode}`")
-                            # 这里的 content 是父块（2000字），我们只展示前 150 字预览
-                            content_preview = doc.page_content[:150].replace('\n', ' ')
-                            st.caption(f"原文片段: ...{content_preview}...")
-                            st.divider()
+                        # 来源展示 (带引用编号对应)
+                        if source_docs:
+                            with st.expander("📚 参考来源 (点击展开)"):
+                                for i, doc in enumerate(source_docs):
+                                    source = os.path.basename(doc.metadata.get("source", "未知文件"))
+                                    page = doc.metadata.get("page", 0) + 1
+                                    mode = doc.metadata.get("parsing_mode", "unknown")
+                                    st.markdown(f"**[{i + 1}] 来源:** `{source}` (第 {page} 页) | 模式: `{mode}`")
+                                    # 这里的 content 是父块（2000字），我们只展示前 150 字预览
+                                    content_preview = doc.page_content[:150].replace('\n', ' ')
+                                    st.caption(f"原文片段: ...{content_preview}...")
+                                    st.divider()
+                        
+                        # 用户反馈按钮
+                        st.markdown("---")
+                        st.caption("这个回答对您有帮助吗？")
+                        col1, col2, col3 = st.columns([1, 1, 8])
+                        with col1:
+                            if st.button("👍", key=f"up_{run_id}"):
+                                log_feedback(run_id, 1)
+                                st.toast("感谢您的反馈！", icon="✅")
+                        with col2:
+                            if st.button("👎", key=f"down_{run_id}"):
+                                log_feedback(run_id, 0)
+                                st.toast("感谢您的反馈！我们会继续改进。", icon="📝")
 
                 except Exception as e:
+                    status_placeholder.empty()
                     st.error(f"发生错误: {e}")
         else:
             st.error("知识库初始化失败，请重试。")

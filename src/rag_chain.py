@@ -56,9 +56,311 @@ def log_feedback(run_id: str, score: int, comment: Optional[str] = None):
 
 from langchain_core.pydantic_v1 import BaseModel, Field
 
+# ========== CRAG 纠错检索 (Corrective RAG) ==========
+class GradeDocuments(BaseModel):
+    """检索结果相关性评分"""
+    binary_score: str = Field(
+        description="文档是否与问题相关, 'yes' 或 'no'"
+    )
+    reasoning: str = Field(
+        description="评分理由",
+        default=""
+    )
+
+
+class DocumentGrader:
+    """
+    CRAG 文档评分器：评估检索结果质量，过滤不相关文档
+    当检索质量差时触发回退策略
+    """
+    
+    GRADING_PROMPT = """你是一个检索质量评估专家。判断下面的文档是否与用户问题相关。
+
+用户问题: {question}
+
+检索到的文档:
+{document}
+
+评判标准:
+1. 文档是否包含与问题相关的关键词或语义信息
+2. 文档内容是否能帮助回答这个问题
+3. 即使只是部分相关也应该判定为相关
+
+请返回 JSON 格式:
+{{"binary_score": "yes/no", "reasoning": "简短理由"}}"""
+    
+    def __init__(self, llm):
+        self.llm = llm
+        self.output_parser = StrOutputParser()
+    
+    def grade_document(self, question: str, doc_content: str) -> bool:
+        """
+        评估单个文档是否与问题相关
+        返回: True=相关, False=不相关
+        """
+        try:
+            prompt = self.GRADING_PROMPT.format(
+                question=question,
+                document=doc_content[:1000]  # 限制长度
+            )
+            response = self.llm.invoke(prompt)
+            result_text = self.output_parser.invoke(response)
+            
+            # 解析 JSON
+            import re
+            json_match = re.search(r'\{[^}]+\}', result_text, re.DOTALL)
+            if json_match:
+                result = json.loads(json_match.group())
+                return result.get("binary_score", "no").lower() == "yes"
+            return True  # 解析失败时保守处理
+        except Exception as e:
+            print(f"文档评分失败: {e}")
+            return True  # 失败时保守处理
+    
+    def grade_and_filter(self, question: str, docs: list, threshold: float = 0.5) -> tuple:
+        """
+        CRAG 核心逻辑：评估并过滤检索结果
+        
+        Args:
+            question: 用户问题
+            docs: 检索到的文档列表
+            threshold: 不相关文档比例阈值，超过则触发回退
+            
+        Returns:
+            (filtered_docs, need_fallback, stats)
+        """
+        if not docs:
+            return [], True, {"total": 0, "relevant": 0, "irrelevant": 0}
+        
+        filtered_docs = []
+        irrelevant_count = 0
+        
+        for doc in docs:
+            is_relevant = self.grade_document(question, doc.page_content)
+            if is_relevant:
+                filtered_docs.append(doc)
+            else:
+                irrelevant_count += 1
+        
+        total = len(docs)
+        relevant_count = total - irrelevant_count
+        need_fallback = (irrelevant_count / total) > threshold if total > 0 else True
+        
+        stats = {
+            "total": total,
+            "relevant": relevant_count,
+            "irrelevant": irrelevant_count,
+            "relevance_ratio": relevant_count / total if total > 0 else 0
+        }
+        
+        return filtered_docs, need_fallback, stats
+
+
+# ========== 语义缓存 (Semantic Cache) ==========
+class SemanticCache:
+    """
+    语义缓存：使用向量相似度匹配缓存
+    相比字符串匹配，可以识别语义相似的问题
+    例如: "How are you?" 和 "How are you" 会命中同一缓存
+    """
+    
+    def __init__(self, embeddings, threshold: float = 0.92, max_size: int = 1000):
+        """
+        Args:
+            embeddings: 嵌入模型
+            threshold: 相似度阈值 (0-1)，越高越严格
+            max_size: 最大缓存条目数
+        """
+        self.embeddings = embeddings
+        self.threshold = threshold
+        self.max_size = max_size
+        self.cache_path = "./logs/semantic_cache.pkl"
+        self.cache_vectors = []  # [(question, question_vector, answer, timestamp)]
+        self._load_cache()
+    
+    def _load_cache(self):
+        """从磁盘加载缓存"""
+        import pickle
+        if os.path.exists(self.cache_path):
+            try:
+                with open(self.cache_path, "rb") as f:
+                    self.cache_vectors = pickle.load(f)
+                print(f"✅ 语义缓存已加载: {len(self.cache_vectors)} 条")
+            except Exception as e:
+                print(f"加载语义缓存失败: {e}")
+                self.cache_vectors = []
+    
+    def _save_cache(self):
+        """保存缓存到磁盘"""
+        import pickle
+        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+        try:
+            with open(self.cache_path, "wb") as f:
+                pickle.dump(self.cache_vectors, f)
+        except Exception as e:
+            print(f"保存语义缓存失败: {e}")
+    
+    def _cosine_similarity(self, vec1, vec2) -> float:
+        """计算余弦相似度"""
+        import numpy as np
+        vec1 = np.array(vec1)
+        vec2 = np.array(vec2)
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot_product / (norm1 * norm2)
+    
+    def get(self, question: str) -> Optional[str]:
+        """
+        语义缓存查询
+        返回: 缓存的答案，未命中返回 None
+        """
+        if not self.cache_vectors:
+            return None
+        
+        try:
+            q_vec = self.embeddings.embed_query(question)
+            
+            best_match = None
+            best_similarity = 0
+            
+            for cached_q, cached_vec, answer, _ in self.cache_vectors:
+                similarity = self._cosine_similarity(q_vec, cached_vec)
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match = (cached_q, answer)
+            
+            if best_similarity >= self.threshold:
+                print(f"🎯 语义缓存命中: {best_similarity:.2%} 相似度")
+                return best_match[1]
+            
+            return None
+        except Exception as e:
+            print(f"语义缓存查询失败: {e}")
+            return None
+    
+    def set(self, question: str, answer: str):
+        """添加到语义缓存"""
+        try:
+            q_vec = self.embeddings.embed_query(question)
+            timestamp = time.time()
+            
+            # 检查是否已存在非常相似的问题
+            for i, (cached_q, cached_vec, _, _) in enumerate(self.cache_vectors):
+                similarity = self._cosine_similarity(q_vec, cached_vec)
+                if similarity >= 0.98:  # 几乎完全相同，更新答案
+                    self.cache_vectors[i] = (question, q_vec, answer, timestamp)
+                    self._save_cache()
+                    return
+            
+            # 添加新缓存
+            self.cache_vectors.append((question, q_vec, answer, timestamp))
+            
+            # 限制缓存大小 (LRU: 删除最旧的)
+            if len(self.cache_vectors) > self.max_size:
+                self.cache_vectors.sort(key=lambda x: x[3])  # 按时间排序
+                self.cache_vectors = self.cache_vectors[-self.max_size:]
+            
+            self._save_cache()
+        except Exception as e:
+            print(f"语义缓存写入失败: {e}")
+
+
+# ========== Token 管理器 ==========
+class TokenManager:
+    """
+    Token 管理器：确保上下文不超过模型限制
+    支持 tiktoken 精确计数和字符估算回退
+    """
+    
+    def __init__(self, model_name: str = "gpt-4", max_context_tokens: int = 6000):
+        """
+        Args:
+            model_name: 模型名称，用于选择正确的 tokenizer
+            max_context_tokens: 上下文最大 token 数
+        """
+        self.model_name = model_name
+        self.max_context_tokens = max_context_tokens
+        self.encoder = None
+        self._init_encoder()
+    
+    def _init_encoder(self):
+        """初始化 tokenizer"""
+        try:
+            import tiktoken
+            # 尝试获取模型对应的编码器
+            try:
+                self.encoder = tiktoken.encoding_for_model(self.model_name)
+            except KeyError:
+                # 如果模型不支持，使用 cl100k_base (GPT-4 系列)
+                self.encoder = tiktoken.get_encoding("cl100k_base")
+        except ImportError:
+            print("⚠️ tiktoken 未安装，使用字符估算 token 数")
+            self.encoder = None
+    
+    def count_tokens(self, text: str) -> int:
+        """计算文本的 token 数"""
+        if self.encoder:
+            return len(self.encoder.encode(text))
+        else:
+            # 估算：中文约 2 字符/token，英文约 4 字符/token
+            # 保守估计使用 2
+            return len(text) // 2
+    
+    def trim_context(self, context_str: str, reserve_tokens: int = 500) -> str:
+        """
+        裁剪上下文以适应 token 限制
+        
+        Args:
+            context_str: 原始上下文
+            reserve_tokens: 为问题和回答保留的 token 数
+            
+        Returns:
+            裁剪后的上下文
+        """
+        max_allowed = self.max_context_tokens - reserve_tokens
+        current_tokens = self.count_tokens(context_str)
+        
+        if current_tokens <= max_allowed:
+            return context_str
+        
+        # 需要裁剪
+        print(f"⚠️ 上下文过长 ({current_tokens} tokens)，正在裁剪至 {max_allowed} tokens")
+        
+        if self.encoder:
+            # 精确裁剪
+            tokens = self.encoder.encode(context_str)
+            truncated_tokens = tokens[:max_allowed]
+            truncated_text = self.encoder.decode(truncated_tokens)
+        else:
+            # 字符估算裁剪
+            char_limit = max_allowed * 2
+            truncated_text = context_str[:char_limit]
+        
+        return truncated_text + "\n\n[注: 上下文已截断以适应模型限制]"
+    
+    def trim_documents(self, docs: list, max_docs: int = 5) -> list:
+        """
+        限制文档数量和总长度
+        
+        Args:
+            docs: 文档列表
+            max_docs: 最大文档数
+            
+        Returns:
+            裁剪后的文档列表
+        """
+        if len(docs) <= max_docs:
+            return docs
+        
+        # 按相关性排序（假设已经排序），取前 N 个
+        return docs[:max_docs]
+
 class RouteQuery(BaseModel):
     """用户查询意图分类"""
-    intent: Literal["GREETING", "SIMPLE", "COMPLEX", "ABSTRACT"] = Field(
+    intent: Literal["GREETING", "SIMPLE", "COMPLEX", "ABSTRACT", "METADATA_QUERY", "COMPARE", "SUMMARIZE", "OUT_OF_DOMAIN"] = Field(
         description="查询意图类型"
     )
     reasoning: str = Field(
@@ -77,7 +379,7 @@ class QueryPlanner:
     def classify_intent(self, question: str) -> str:
         """
         使用 LLM 对用户问题进行意图分类
-        返回: GREETING | SIMPLE | COMPLEX | ABSTRACT
+        返回: GREETING | SIMPLE | COMPLEX | ABSTRACT | METADATA_QUERY | COMPARE | SUMMARIZE | OUT_OF_DOMAIN
         """
         routing_prompt = f"""分析用户问题，判断其意图类型。
 
@@ -86,12 +388,15 @@ class QueryPlanner:
 类型判断标准:
 1. GREETING: 打招呼或闲聊（如：你好、谢谢、再见、hi、hello）
 2. SIMPLE: 事实性简单问题，只需单一概念查询（如：XX是什么时候发布的？）
-3. COMPLEX: 涉及对比、多跳推理或需要多角度回答（如：华为和小米哪个好？）
+3. COMPLEX: 涉及多跳推理或需要多角度回答（如：这个技术如何影响XX？）
 4. ABSTRACT: 概念性问题，适合先生成假设性答案再检索（如：什么是量子纠缠？如何理解XX？）
+5. METADATA_QUERY: 询问知识库元信息（如：有哪些文档？文件列表？）
+6. COMPARE: 对比类问题（如：A和B有什么区别？X好还是Y好？）
+7. SUMMARIZE: 总结类问题（如：总结这篇文档、概括主要内容）
+8. OUT_OF_DOMAIN: 与知识库无关的问题（如：今天天气怎么样？）
 
 请只返回一个 JSON 格式:
-{{"intent": "类型", "reasoning": "理由"}}
-"""
+{{"intent": "类型", "reasoning": "理由"}}"""
         try:
             response = self.llm.invoke(routing_prompt)
             result_text = self.output_parser.invoke(response)
@@ -103,8 +408,13 @@ class QueryPlanner:
             if json_match:
                 result = json.loads(json_match.group())
                 intent = result.get("intent", "SIMPLE").upper()
-                if intent in ["GREETING", "SIMPLE", "COMPLEX", "ABSTRACT"]:
+                valid_intents = ["GREETING", "SIMPLE", "COMPLEX", "ABSTRACT", 
+                                "METADATA_QUERY", "COMPARE", "SUMMARIZE", "OUT_OF_DOMAIN"]
+                if intent in valid_intents:
                     return intent
+            return "SIMPLE"
+        except Exception as e:
+            print(f"意图分类失败: {e}")
             return "SIMPLE"
         except Exception as e:
             print(f"意图分类失败: {e}")
@@ -119,13 +429,31 @@ class QueryPlanner:
         result = {
             "type": intent,
             "queries": [question],
-            "use_hyde": intent == "ABSTRACT"
+            "use_hyde": intent == "ABSTRACT",
+            "sub_questions": [],
+            "skip_retrieval": False
         }
         
-        # COMPLEX 和 SIMPLE 问题都进行查询扩展以提高召回率
-        if intent in ["COMPLEX", "SIMPLE"]:
+        # 根据意图类型选择不同策略
+        if intent == "GREETING":
+            result["skip_retrieval"] = True
+        elif intent == "OUT_OF_DOMAIN":
+            result["skip_retrieval"] = True
+        elif intent == "METADATA_QUERY":
+            result["skip_retrieval"] = True  # 直接查询数据库元信息
+        elif intent in ["COMPLEX", "COMPARE"]:
+            # 复杂/对比问题使用子问题分解
+            sub_questions = self.decompose_complex_query(question)
+            result["sub_questions"] = sub_questions
+            result["queries"] = [question] + sub_questions
+        elif intent == "SIMPLE":
+            # SIMPLE 问题使用查询扩展
             variants = self.expand_query(question)
             result["queries"] = [question] + variants
+        elif intent == "SUMMARIZE":
+            # 总结问题：不扩展查询，使用更大的检索范围
+            result["queries"] = [question]
+        # ABSTRACT: 使用 HyDE，已在初始化时设置
         
         return result
 
@@ -184,13 +512,47 @@ class QueryPlanner:
             print(f"HyDE生成失败: {e}")
             return ""
 
+    def decompose_complex_query(self, question: str) -> List[str]:
+        """
+        将复杂问题分解为可独立回答的子问题
+        适用于对比类、多跳推理类问题
+        例如: "华为和小米的手机哪个好?" -> ["华为手机有什么特点?", "小米手机有什么特点?", "华为小米手机对比"]
+        """
+        prompt = f"""将以下复杂问题分解为2-4个可独立回答的子问题。
+每个子问题应该可以通过单独的知识库检索来回答。
+
+问题: {question}
+
+要求:
+1. 每个子问题占一行
+2. 子问题应该简洁明了
+3. 不要编号
+4. 不要添加解释
+
+示例:
+问题: "比较Python和Java在机器学习领域的应用"
+Python在机器学习中的优势
+Java在机器学习中的应用
+Python和Java性能对比"""
+        
+        try:
+            response = self.llm.invoke(prompt)
+            result = self.output_parser.invoke(response)
+            sub_questions = [q.strip() for q in result.strip().split("\n") if q.strip()]
+            # 过滤掉太短或太长的子问题
+            sub_questions = [q for q in sub_questions if 4 < len(q) < 100]
+            return sub_questions[:4]  # 最多返回4个
+        except Exception as e:
+            print(f"子问题分解失败: {e}")
+            return [question]  # 失败时返回原问题
+
 
 class ManualHistoryRAGChain:
     """
     手动实现的 RAG 链，集成父子索引策略 (Small-to-Big Retrieval)
     """
 
-    def __init__(self, retriever, qa_prompt, history_prompt, llm):
+    def __init__(self, retriever, qa_prompt, history_prompt, llm, embeddings=None):
         self.retriever = retriever
         self.qa_prompt = qa_prompt
         self.history_prompt = history_prompt
@@ -199,6 +561,15 @@ class ManualHistoryRAGChain:
         # 获取父文档存储路径
         self.doc_store_path = getattr(config, "PARENT_DOC_STORE_PATH", "./doc_store")
         self.planner = QueryPlanner(llm)
+        # CRAG 文档评分器
+        self.grader = DocumentGrader(llm)
+        # 是否启用 CRAG
+        self.use_crag = True
+        # 语义缓存 (需要传入 embeddings)
+        self.semantic_cache = SemanticCache(embeddings) if embeddings else None
+        self.use_semantic_cache = embeddings is not None
+        # Token 管理器
+        self.token_manager = TokenManager(max_context_tokens=6000)
 
     def _rewrite_question(self, question, chat_history):
 
@@ -314,6 +685,63 @@ class ManualHistoryRAGChain:
                 unique_docs.append(doc)
         return unique_docs
 
+    def _apply_crag(self, question: str, docs: list, search_query: str) -> tuple:
+        """
+        应用 CRAG (Corrective RAG) 纠错检索
+        
+        Args:
+            question: 用户原始问题
+            docs: 检索到的文档
+            search_query: 重写后的搜索查询
+            
+        Returns:
+            (filtered_docs, crag_stats)
+        """
+        if not self.use_crag or not docs:
+            return docs, {"crag_enabled": False}
+        
+        # 评估文档质量
+        filtered_docs, need_fallback, stats = self.grader.grade_and_filter(
+            question, docs, threshold=0.5
+        )
+        
+        crag_stats = {
+            "crag_enabled": True,
+            "original_count": stats["total"],
+            "filtered_count": len(filtered_docs),
+            "relevance_ratio": stats["relevance_ratio"],
+            "fallback_triggered": need_fallback
+        }
+        
+        # 如果需要回退且过滤后文档太少
+        if need_fallback and len(filtered_docs) < 2:
+            # 回退策略 1: 使用 HyDE 重试
+            print(f"⚠️ CRAG 触发回退: 相关性比例 {stats['relevance_ratio']:.1%}")
+            
+            hyde_doc = self.planner.generate_hyde_doc(question)
+            if hyde_doc:
+                enhanced_query = f"{search_query}\n{hyde_doc}"
+                base_retriever = self._get_base_retriever()
+                retry_docs = base_retriever.invoke(enhanced_query)
+                
+                # 再次评分
+                retry_filtered, _, retry_stats = self.grader.grade_and_filter(
+                    question, retry_docs, threshold=0.7
+                )
+                
+                if retry_filtered:
+                    filtered_docs.extend(retry_filtered)
+                    filtered_docs = self._deduplicate_docs(filtered_docs)
+                    crag_stats["hyde_retry"] = True
+                    crag_stats["retry_added"] = len(retry_filtered)
+        
+        # 如果仍然没有足够的文档，返回原始文档的前几个
+        if len(filtered_docs) < 1:
+            filtered_docs = docs[:3]
+            crag_stats["fallback_to_original"] = True
+        
+        return filtered_docs, crag_stats
+
     def _prepare_context(self, input_dict: dict) -> dict:
         """
         准备上下文的辅助方法，抽取检索/规划逻辑供 invoke 和 stream 共用
@@ -359,6 +787,7 @@ class ManualHistoryRAGChain:
         child_docs = []
         final_docs = []
         context_str = ""
+        crag_stats = {"crag_enabled": False}
         
         if planning_type == "GREETING":
             # 闲聊模式：不检索，直接生成
@@ -383,8 +812,15 @@ class ManualHistoryRAGChain:
             
             child_docs = self._deduplicate_docs(all_docs)
             child_docs = self._rerank_documents(child_docs, search_query)
+            
+            # CRAG: 评估并过滤文档
+            child_docs, crag_stats = self._apply_crag(question, child_docs, search_query)
+            
             final_docs = self._map_children_to_parents(child_docs)
+            # Token 管理：限制文档数量和上下文长度
+            final_docs = self.token_manager.trim_documents(final_docs, max_docs=5)
             context_str = "\n\n".join([f"[文档 {i+1}]: {d.page_content}" for i, d in enumerate(final_docs)])
+            context_str = self.token_manager.trim_context(context_str)
         
         elif planning_type == "ABSTRACT":
             # 抽象问题：使用 HyDE 增强
@@ -392,8 +828,15 @@ class ManualHistoryRAGChain:
             final_query = f"{search_query}\n{hyde_doc}" if hyde_doc else search_query
             
             child_docs = self.retriever.invoke(final_query)
+            
+            # CRAG: 评估并过滤文档
+            child_docs, crag_stats = self._apply_crag(question, child_docs, search_query)
+            
             final_docs = self._map_children_to_parents(child_docs)
+            # Token 管理：限制文档数量和上下文长度
+            final_docs = self.token_manager.trim_documents(final_docs, max_docs=5)
             context_str = "\n\n".join([f"[文档 {i+1}]: {d.page_content}" for i, d in enumerate(final_docs)])
+            context_str = self.token_manager.trim_context(context_str)
         
         else:  # SIMPLE
             base_retriever = self._get_base_retriever()
@@ -413,8 +856,15 @@ class ManualHistoryRAGChain:
             
             child_docs = self._deduplicate_docs(all_docs)
             child_docs = self._rerank_documents(child_docs, search_query)
+            
+            # CRAG: 评估并过滤文档
+            child_docs, crag_stats = self._apply_crag(question, child_docs, search_query)
+            
             final_docs = self._map_children_to_parents(child_docs)
+            # Token 管理：限制文档数量和上下文长度
+            final_docs = self.token_manager.trim_documents(final_docs, max_docs=5)
             context_str = "\n\n".join([f"[文档 {i+1}]: {d.page_content}" for i, d in enumerate(final_docs)])
+            context_str = self.token_manager.trim_context(context_str)
         
         # 格式化 QA 提示词
         formatted_qa_prompt = self.qa_prompt.invoke({
@@ -434,7 +884,8 @@ class ManualHistoryRAGChain:
             "final_docs": final_docs,
             "context_str": context_str,
             "formatted_qa_prompt": formatted_qa_prompt,
-            "cache_hit": None
+            "cache_hit": None,
+            "crag_stats": crag_stats
         }
 
     def stream(self, input_dict: dict):
@@ -643,7 +1094,14 @@ class ManualHistoryRAGChain:
         }
 
     def _check_cache(self, question):
-        """简单本地缓存检查"""
+        """检查缓存 - 优先使用语义缓存"""
+        # 优先使用语义缓存
+        if self.use_semantic_cache and self.semantic_cache:
+            result = self.semantic_cache.get(question)
+            if result:
+                return result
+        
+        # 回退到字符串缓存
         cache_path = "./logs/cache.json"
         if os.path.exists(cache_path):
             try:
@@ -655,7 +1113,12 @@ class ManualHistoryRAGChain:
         return None
 
     def _update_cache(self, question, answer):
-        """更新本地缓存"""
+        """更新缓存 - 同时更新语义缓存和字符串缓存"""
+        # 更新语义缓存
+        if self.use_semantic_cache and self.semantic_cache:
+            self.semantic_cache.set(question, answer)
+        
+        # 同时更新字符串缓存 (作为备份)
         cache_path = "./logs/cache.json"
         os.makedirs("./logs", exist_ok=True)
         cache = {}
@@ -796,5 +1259,5 @@ def get_rag_chain(custom_prompt=None):
         ("human", "{question}"),
     ])
 
-    # 返回支持父子索引的 Chain
-    return ManualHistoryRAGChain(final_retriever, qa_prompt, history_prompt, llm)
+    # 返回支持父子索引的 Chain (传入 embeddings 以启用语义缓存)
+    return ManualHistoryRAGChain(final_retriever, qa_prompt, history_prompt, llm, embeddings=embeddings)

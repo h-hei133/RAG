@@ -15,6 +15,75 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
+from langchain_core.output_parsers import StrOutputParser
+
+
+# ========== Contextual Retrieval (Anthropic 方法) ==========
+CONTEXT_PROMPT = """<document>
+{whole_document}
+</document>
+Here is the chunk we want to situate within the whole document:
+<chunk>
+{chunk_content}
+</chunk>
+请为这个文本块生成一段简短的上下文说明，用于帮助检索系统更好地理解这个块在整个文档中的位置和含义。
+要求：
+1. 说明这个块属于哪个文档/章节
+2. 补充必要的背景信息（如公司名、时间、主题等）
+3. 只返回上下文说明，不要返回其他内容
+4. 控制在50-100字以内"""
+
+
+class ContextualChunkEnricher:
+    """
+    上下文增强器：为每个 chunk 添加上下文前缀
+    根据 Anthropic 的 Contextual Retrieval 方法，可降低检索失败率 35-67%
+    """
+    
+    def __init__(self, llm=None):
+        if llm is None:
+            self.llm = ChatOpenAI(
+                model=config.LLM_MODEL_NAME,
+                openai_api_key=config.API_KEY,
+                openai_api_base=config.BASE_URL,
+                temperature=0.1,
+                max_tokens=200
+            )
+        else:
+            self.llm = llm
+        self.output_parser = StrOutputParser()
+    
+    def generate_context(self, whole_doc: str, chunk: str) -> str:
+        """
+        为单个 chunk 生成上下文前缀
+        whole_doc: 完整文档内容（或父块内容）
+        chunk: 需要添加上下文的子块
+        """
+        try:
+            # 限制文档长度避免超出上下文窗口
+            max_doc_len = 8000
+            truncated_doc = whole_doc[:max_doc_len] if len(whole_doc) > max_doc_len else whole_doc
+            
+            prompt = CONTEXT_PROMPT.format(
+                whole_document=truncated_doc,
+                chunk_content=chunk
+            )
+            response = self.llm.invoke(prompt)
+            context = self.output_parser.invoke(response)
+            return context.strip()
+        except Exception as e:
+            print(f"上下文生成失败: {e}")
+            return ""
+    
+    def enrich_chunk(self, whole_doc: str, chunk: str) -> str:
+        """
+        返回带上下文前缀的 chunk
+        格式: [上下文说明]\n\n[原始内容]
+        """
+        context = self.generate_context(whole_doc, chunk)
+        if context:
+            return f"[背景: {context}]\n\n{chunk}"
+        return chunk
 
 
 def init_db():
@@ -223,12 +292,14 @@ class DualModePDFParser:
         return parsed_docs
 
 
-def ingest_document(file_paths, parsing_strategy="auto", progress_callback=None):
+def ingest_document(file_paths, parsing_strategy="auto", progress_callback=None, use_contextual_retrieval=False):
     """
     全流程接入：
     1. 自适应混合解析 (Smart Hybrid Parsing)
     2. 父子切分 (Parent-Child Indexing)
     3. 向量化存储
+    
+    注意: use_contextual_retrieval=True 会显著增加处理时间 (每个子块需调用 LLM)
     """
     if isinstance(file_paths, str):
         file_paths = [file_paths]
@@ -244,6 +315,12 @@ def ingest_document(file_paths, parsing_strategy="auto", progress_callback=None)
 
     # 初始化解析器
     parser = DualModePDFParser()
+    
+    # 初始化上下文增强器 (Contextual Retrieval) - 默认关闭以加速
+    context_enricher = None
+    if use_contextual_retrieval:
+        context_enricher = ContextualChunkEnricher()
+        print("✨ 已启用 Contextual Retrieval (Anthropic 方法) - 注意：这会增加处理时间")
 
     for file_path in file_paths:
         if not os.path.exists(file_path):
@@ -261,6 +338,10 @@ def ingest_document(file_paths, parsing_strategy="auto", progress_callback=None)
 
             import time
             ingest_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 统计总子块数用于进度显示
+            total_parent_docs = len(parent_docs)
+            processed_parents = 0
 
             for parent_doc in parent_docs:
                 doc_id = str(uuid.uuid4())
@@ -284,9 +365,33 @@ def ingest_document(file_paths, parsing_strategy="auto", progress_callback=None)
                     child.metadata["child_id"] = f"{doc_id}_{i}"
                     child.metadata["source"] = os.path.basename(file_path)
                     child.metadata["ingest_time"] = ingest_time
+                    
+                    # 步骤 E: Contextual Retrieval - 为子块添加上下文前缀
+                    if context_enricher:
+                        original_content = child.page_content
+                        child.page_content = context_enricher.enrich_chunk(
+                            parent_doc.page_content,  # 使用父块作为上下文
+                            original_content
+                        )
+                        child.metadata["has_context"] = True
+                        child.metadata["original_content"] = original_content
 
 
                 all_child_docs.extend(child_docs)
+                
+                # 更新进度
+                processed_parents += 1
+                if progress_callback:
+                    progress_callback(
+                        processed_parents,
+                        total_parent_docs,
+                        f"正在索引文档块 {processed_parents}/{total_parent_docs}..."
+                    )
+                else:
+                    # 控制台进度
+                    print(f"\r  正在索引: {processed_parents}/{total_parent_docs} 块", end="", flush=True)
+            
+            print()  # 换行
 
             print(f"  - 处理完成: {len(parent_docs)} 个父块 / {len(all_child_docs)} 个子块")
 

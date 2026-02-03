@@ -5,7 +5,17 @@ venv/
 .env
 env/
 .conda/
+
 chroma_db/
 data/
 doc_store/
+doc_store.db
 extracted_images/
+
+logs/
+*.pkl
+*.db
+
+temp.py
+test.py
+check.py

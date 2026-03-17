@@ -291,7 +291,8 @@ class RAGEvaluator:
                     for key in metrics:
                         if result.get(key) is not None:
                             metrics[key].append(result[key])
-                except:
+                except Exception:
+                    # 重构：裸 except 改为 except Exception，明确捕获意图（跳过格式错误的行）
                     continue
         
         return {
@@ -324,7 +325,8 @@ def create_evaluation_dataset_from_logs(log_path: str = "./logs/rag_activity.jso
                 )
                 if sample.question and sample.answer:
                     samples.append(sample)
-            except:
+            except Exception:
+                # 重构：裸 except 改为 except Exception，明确捕获意图（跳过格式错误的行）
                 continue
     
     return samples

@@ -5,61 +5,87 @@
 ## 核心特性
 
 ### 1. 自适应混合解析 (Smart Hybrid Parsing)
-*   **Dual-Mode 引擎**：自动检测 PDF 页面复杂度。
-*   **Fast Mode**：纯文本页面秒级提取，并自动还原 Markdown 表格。
-*   **Vision Mode**：集成 **Qwen-VL** 多模态大模型，针对复杂图表、PPT、架构图进行版面分析，将视觉信息转译为结构化 Markdown。
+
+- **Dual-Mode 引擎**：自动检测 PDF 页面复杂度。
+- **Fast Mode**：纯文本页面秒级提取，并自动还原 Markdown 表格。
+- **Vision Mode**：集成 **Qwen-VL** 多模态大模型，针对复杂图表、PPT、架构图进行版面分析，将视觉信息转译为结构化 Markdown。
 
 ### 2. 父子索引置换 (Small-to-Big Retrieval)
-*   **精准检索**：将文档切分为 400 字符的"子块"进行向量索引，确保检索的高精度。
-*   **完整生成**：在 LLM 读取阶段，自动将子块置换为 2000 字符的"父块"上下文，彻底解决"断章取义"问题。
+
+- **精准检索**：将文档切分为 400 字符的"子块"进行向量索引，确保检索的高精度。
+- **完整生成**：在 LLM 读取阶段，自动将子块置换为 2000 字符的"父块"上下文，彻底解决"断章取义"问题。
 
 ### 3. 查询规划器 (Query Planner)
-*   **8类意图识别**：GREETING, SIMPLE, COMPLEX, ABSTRACT, METADATA_QUERY, COMPARE, SUMMARIZE, OUT_OF_DOMAIN
-*   **子问题分解**：复杂/对比问题自动分解为可独立回答的子问题
-*   **HyDE (假设性文档嵌入)**：针对抽象概念问题，先生成假设性回答再检索
-*   **历史指代消解**：结合上下文自动重写用户 Query，支持多轮深度对话
+
+- **9类意图识别**：GREETING, SIMPLE, COMPLEX, ABSTRACT, METADATA_QUERY, COMPARE, SUMMARIZE, STRUCTURED_DATA_QUERY, OUT_OF_DOMAIN
+- **子问题分解**：复杂/对比问题自动分解为可独立回答的子问题
+- **HyDE (假设性文档嵌入)**：针对抽象概念问题，先生成假设性回答再检索
+- **历史指代消解**：结合上下文自动重写用户 Query，支持多轮深度对话
+
+### 10. 多会话隔离与持久化
+
+- **会话级存储隔离**：每个会话独立维护 data/chroma/sqlite/logs/cache/image
+- **互不污染**：新会话默认无文档，上传和检索仅作用于当前会话
+- **会话可恢复**：会话元数据自动写入 `sessions/session_registry.json`，重启后自动恢复
+- **目录兜底发现**：即使注册文件缺失，也可从 `sessions/session_*` 目录自动重建会话
+
+### 11. Agentic RAG 扩展
+
+- **动态 Web 兜底**：本地召回不足时自动补充互联网信息
+- **结构化查询分流**：统计/聚合类问题自动路由至 CSV/XLSX 分析器
+- **多源融合生成**：本地文档与外部来源统一进入上下文生成答案
 
 ### 4. Contextual Retrieval (Anthropic 方法)
-*   **上下文增强**：在 embedding 之前为每个 chunk 添加上下文前缀
-*   **效果**：检索失败率降低 35-67% (Anthropic 官方数据)
+
+- **上下文增强**：在 embedding 之前为每个 chunk 添加上下文前缀
+- **效果**：检索失败率降低 35-67% (Anthropic 官方数据)
 
 ### 5. CRAG 纠错检索 (Corrective RAG)
-*   **质量评估**：LLM 自动评估检索结果的相关性
-*   **智能回退**：低质量结果时自动触发 HyDE 重试
-*   **过滤噪声**：只保留真正相关的文档进入上下文
+
+- **质量评估**：LLM 自动评估检索结果的相关性
+- **智能回退**：低质量结果时自动触发 HyDE 重试
+- **过滤噪声**：只保留真正相关的文档进入上下文
 
 ### 6. 语义缓存 (Semantic Cache)
-*   **向量匹配**：使用 embedding 相似度而非字符串精确匹配
-*   **模糊命中**："How are you?" 和 "How are you" 会命中同一缓存
-*   **持久化**：缓存自动保存到磁盘，重启后仍有效
+
+- **向量匹配**：使用 embedding 相似度而非字符串精确匹配
+- **模糊命中**："How are you?" 和 "How are you" 会命中同一缓存
+- **持久化**：缓存自动保存到磁盘，重启后仍有效
 
 ### 7. Token 管理与溢出保护
-*   **精确计数**：使用 tiktoken 精确计算 token 数
-*   **智能裁剪**：上下文过长时自动截断，避免模型溢出
-*   **文档限制**：限制返回文档数量，确保上下文质量
+
+- **精确计数**：使用 tiktoken 精确计算 token 数
+- **智能裁剪**：上下文过长时自动截断，避免模型溢出
+- **文档限制**：限制返回文档数量，确保上下文质量
 
 ### 8. 生产级优化
-*   **混合检索 (Hybrid Search)**：BM25 + MMR 向量检索
-*   **Rerank 重排序**：Cross-Encoder 二次精排
-*   **流式输出**：实时返回生成结果
+
+- **混合检索 (Hybrid Search)**：BM25 + MMR 向量检索
+- **Rerank 重排序**：Cross-Encoder 二次精排
+- **流式输出**：实时返回生成结果
+- **速度优先模式**：可一键关闭 CRAG/多路查询/幻觉检测等高耗时链路，显著降低延迟
+- **链实例缓存**：同一会话和配置下复用 RAG 链，减少重复初始化开销
 
 ### 9. RAGAS 评估框架
-*   **Faithfulness**：评估答案是否基于上下文生成
-*   **Answer Relevancy**：评估答案是否回答了问题
-*   **Context Precision**：评估检索的信噪比
-*   **双模式**：支持 RAGAS 库和 LLM 自评估
+
+- **Faithfulness**：评估答案是否基于上下文生成
+- **Answer Relevancy**：评估答案是否回答了问题
+- **Context Precision**：评估检索的信噪比
+- **双模式**：支持 RAGAS 库和 LLM 自评估
 
 ## 技术栈
-*   **框架**: LangChain
-*   **LLM/VLM**: Qwen-VL (30B), Qwen-3
-*   **向量库**: ChromaDB
-*   **前端**: Streamlit
-*   **模型服务**: SiliconFlow API
-*   **评估**: RAGAS (可选)
+
+- **框架**: LangChain
+- **LLM/VLM**: Qwen-VL (30B), Qwen-3
+- **向量库**: ChromaDB
+- **前端**: Streamlit
+- **模型服务**: SiliconFlow API
+- **评估**: RAGAS (可选)
 
 ## 快速开始
 
 1. **环境准备**
+
    ```bash
    pip install -r requirements.txt
    ```
@@ -73,12 +99,14 @@
    ```
 
 ## 项目结构
+
 ```text
 RAG/
 ├── src/
 │   ├── ingestion.py    # 文档摄取流：混合解析 -> Contextual Retrieval -> 父子切分 -> 索引
 │   ├── rag_chain.py    # RAG 核心链：Query Planner -> CRAG -> 混合检索 -> Rerank -> 生成
 │   └── evaluation.py   # RAGAS 评估框架：Faithfulness, Relevancy, Precision
+├── sessions/           # 多会话隔离存储（每个会话独立 data/chroma/logs）
 ├── chroma_db/          # 向量数据库与 BM25 索引存储
 ├── doc_store.db        # SQLite 父文档存储
 ├── logs/               # RAG 活动日志、语义缓存、评估结果
@@ -88,18 +116,19 @@ RAG/
 
 ## 优化效果对比
 
-| 能力 | 优化前 | 优化后 |
-|------|--------|--------|
-| 意图识别 | 4类 | 8类 |
-| 语义缓存 | 字符串匹配 | 向量相似度 |
-| 检索质量 | 无校验 | CRAG 自动评估+回退 |
-| 上下文 | 无处理 | Contextual Retrieval |
-| Token 管理 | 无 | 自动裁剪保护 |
-| 评估框架 | 无 | RAGAS 集成 |
+| 能力       | 优化前     | 优化后               |
+| ---------- | ---------- | -------------------- |
+| 意图识别   | 4类        | 9类                  |
+| 语义缓存   | 字符串匹配 | 向量相似度           |
+| 检索质量   | 无校验     | CRAG 自动评估+回退   |
+| 上下文     | 无处理     | Contextual Retrieval |
+| Token 管理 | 无         | 自动裁剪保护         |
+| 评估框架   | 无         | RAGAS 集成           |
 
 ## 高级配置
 
 ### 启用/禁用功能
+
 ```python
 # 在 rag_chain.py 中
 chain.use_crag = True/False           # CRAG 纠错检索
@@ -109,7 +138,14 @@ chain.use_semantic_cache = True/False  # 语义缓存
 ingest_document(..., use_contextual_retrieval=True/False)  # Contextual Retrieval
 ```
 
+### 速度与可靠性建议
+
+- **压测优先**：在侧边栏开启“速度优先”，并关闭“启用幻觉检测”。
+- **事实核查优先**：关闭“速度优先”，启用幻觉检测并适当提高检测文档窗口。
+- **多会话管理**：会话名称、消息、处理文件会自动持久化，重启后可继续。
+
 ### 评估 RAG 质量
+
 ```python
 from src.evaluation import quick_evaluate, RAGEvaluator
 

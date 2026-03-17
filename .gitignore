@@ -16,6 +16,15 @@ logs/
 *.pkl
 *.db
 
+# Session runtime artifacts
+sessions/session_registry.json
+sessions/**/chroma_db/
+sessions/**/data/
+sessions/**/extracted_images/
+sessions/**/logs/
+sessions/**/doc_store.db
+
 temp.py
 test.py
 check.py
+explain.md
